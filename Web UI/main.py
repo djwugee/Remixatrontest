@@ -138,6 +138,69 @@ def redirect_https(dir, path):
 
     # otherwise, just set the device id and redirect as required
 
+import time
+from datetime import datetime, timedelta
+
+CACHE_EXPIRATION_DAYS = 30  # Set cache expiration to 30 days
+
+def get_cache_key(url_or_file):
+    """Generate a unique cache key for a given URL or file."""
+    return hashlib.md5(url_or_file.encode('utf-8')).hexdigest()
+
+def get_cached_file(cache_key):
+    """Check if a cached file exists, is not expired, and return its path if it does."""
+    cache_path = Path(f"/home/engine/app/project/Web UI/cache/{cache_key}.pkl")
+    if cache_path.exists():
+        # Check if the file is not expired
+        if datetime.fromtimestamp(cache_path.stat().st_mtime) > datetime.now() - timedelta(days=CACHE_EXPIRATION_DAYS):
+            return cache_path
+        else:
+            # If expired, delete the file
+            cache_path.unlink()
+    return None
+
+def save_to_cache(cache_key, data):
+    """Save processed data to cache."""
+    cache_path = Path(f"/home/engine/app/project/Web UI/cache/{cache_key}.pkl")
+    with open(cache_path, 'wb') as f:
+        pickle.dump(data, f)
+
+def clear_cache():
+    """Clear all cached files."""
+    cache_dir = Path("/home/engine/app/project/Web UI/cache")
+    for cache_file in cache_dir.glob("*.pkl"):
+        cache_file.unlink()
+
+def get_cache_size():
+    """Get the total size of the cache directory in bytes."""
+    cache_dir = Path("/home/engine/app/project/Web UI/cache")
+    return sum(f.stat().st_size for f in cache_dir.glob('**/*') if f.is_file())
+
+def process_audio(url_or_file, deviceid):
+    """Process audio file, using cache if available."""
+    cache_key = get_cache_key(url_or_file)
+    cached_file = get_cached_file(cache_key)
+
+    if cached_file:
+        with open(cached_file, 'rb') as f:
+            return pickle.load(f)
+
+    # Existing audio processing code here
+    # ...
+
+    # After processing, save to cache
+    processed_data = {
+        'jukebox': jukebox,
+        'trim_path': str(trim_path),
+        'final_file': str(final_file),
+        'processed_at': time.time()
+    }
+    save_to_cache(cache_key, processed_data)
+
+    return processed_data
+
+# Existing code continues...
+
 def get_cache_key(url_or_file):
     """Generate a unique cache key for a given URL or file."""
     return hashlib.md5(url_or_file.encode('utf-8')).hexdigest()
@@ -382,69 +445,6 @@ def fetch_url():
 
     # if there is already a proc entry for this client, then
     # kill it if it's running.
-
-    proc = None
-
-    if deviceid in procMap:
-        proc = procMap[deviceid]
-
-    if proc != None and proc.is_alive():
-        print('!!!!!! killing', proc.pid, '!!!!!')
-        proc.terminate()
-
-    # start the main audio processing proc and save a pointer to it
-    # for this client
-
-    procMap[deviceid] = Process(target=process_audio, args=(url, deviceid, False, clusters, useCache))
-    procMap[deviceid].start()
-
-    return index()
-
-@app.route('/cancel_fetch')
-def cancel_fetch():
-    """ Cancels the current audio processing
-
-    Returns:
-        flask.Response: HTTP 200 OK
-    """
-
-    deviceid = get_userid()
-    print('cancelling work for', deviceid)
-
-    # if we're not processing for this client already, just return
-    if deviceid not in procMap:
-        return 'OK'
-
-    # otherwise, kill the running process if it's still running
-    proc = procMap[deviceid]
-
-    if proc != None and proc.is_alive():
-        print('!!!!!! killing', proc.pid, '!!!!!')
-        proc.terminate()
-
-    # return
-    return 'OK'
-
-def post_status_message( userid, percentage, message ):
-    """ The main audio processing is done outside of the main thread. From
-    time to time during that processing, we will want to post an update to
-    the client about what's going on. To do this, we call back into the
-    /relay endpoint. That enpoint exists in the main web thread and can send
-    messages via scoket.io.
-
-    Args:
-        userid (string): the client id to whom to send the message
-        percentage (float): the precentage complete
-        message (string): the text update
-    """
-
-    payload = json.dumps({'percentage': percentage, 'message':message})
-
-    requests.get(
-        'http://localhost:8000/relay',
-        params={'namespace': userid, 'event':'status', 'message': payload}
-    )
-
 def process_audio(url, userid, isupload=False, clusters=0, useCache=True):
     """Processes the audio file, using cache if available."""
     cache_key = get_cache_key(url)
@@ -453,6 +453,58 @@ def process_audio(url, userid, isupload=False, clusters=0, useCache=True):
         cached_file = get_cached_file(cache_key)
         if cached_file:
             with open(cached_file, 'rb') as f:
+                cached_data = pickle.load(f)
+                post_status_message(userid, 100, "Loaded from cache")
+                return cached_data['jukebox'], cached_data['trim_path'], cached_data['final_file']
+
+    # Existing audio processing code
+    temp_dir = Path(tempfile.mkdtemp())
+    trim_path = temp_dir / "trimmed"
+    final_file = temp_dir / "final.mp3"
+
+    if not isupload:
+        filename = fetch_from_youtube(url, userid)
+        audioname = filename
+    else:
+        filename = url
+        audioname = Path(filename).name
+
+    # Create an instance of the InfiniteJukebox
+    try:
+        jukebox = InfiniteJukebox(audioname, clusters)
+    except Exception as e:
+        error_message = f"Error processing audio: {str(e)}"
+        socketio.emit('error', {'error': error_message}, room=userid)
+        return None
+
+    # Existing code to process audio and create visualizations
+    # ...
+
+    # After processing, save to cache if useCache is True
+    if useCache:
+        processed_data = {
+            'jukebox': jukebox,
+            'trim_path': str(trim_path),
+            'final_file': str(final_file),
+            'processed_at': time.time()
+        }
+        save_to_cache(cache_key, processed_data)
+
+    return jukebox, trim_path, final_file
+
+@app.route('/cache_info')
+def cache_info():
+    """Display cache information and provide option to clear cache."""
+    cache_size = get_cache_size() / (1024 * 1024)  # Convert to MB
+    return render_template('cache_info.html', cache_size=cache_size)
+
+@app.route('/clear_cache', methods=['POST'])
+def clear_cache_route():
+    """Clear the cache and redirect to cache info page."""
+    clear_cache()
+    return redirect(url_for('cache_info'))
+
+# Existing code continues...
                 cached_data = pickle.load(f)
                 post_status_message(userid, 100, "Loaded from cache")
                 return cached_data['jukebox'], cached_data['trim_path'], cached_data['final_file']
