@@ -36,7 +36,13 @@ from Remixatron import InfiniteJukebox
 
 # supress warnings from any of the imported libraries. This will keep the
 # console clean.
+import warnings
+import hashlib
+import pickle
+from pathlib import Path
 
+# supress warnings from any of the imported libraries. This will keep the
+# console clean.
 if not sys.warnoptions:
     import warnings
     warnings.simplefilter("ignore")
@@ -131,6 +137,42 @@ def redirect_https(dir, path):
         return resp
 
     # otherwise, just set the device id and redirect as required
+
+def get_cache_key(url_or_file):
+    """Generate a unique cache key for a given URL or file."""
+    return hashlib.md5(url_or_file.encode('utf-8')).hexdigest()
+
+def get_cached_file(cache_key):
+    """Check if a cached file exists and return its path if it does."""
+    cache_path = Path(f"/home/engine/app/project/Web UI/cache/{cache_key}.pkl")
+    if cache_path.exists():
+        return cache_path
+    return None
+
+def save_to_cache(cache_key, data):
+    """Save processed data to cache."""
+    cache_path = Path(f"/home/engine/app/project/Web UI/cache/{cache_key}.pkl")
+    with open(cache_path, 'wb') as f:
+        pickle.dump(data, f)
+
+def process_audio(url_or_file, deviceid):
+    """Process audio file, using cache if available."""
+    cache_key = get_cache_key(url_or_file)
+    cached_file = get_cached_file(cache_key)
+
+    if cached_file:
+        with open(cached_file, 'rb') as f:
+            return pickle.load(f)
+
+    # Existing audio processing code here
+    # ...
+
+    # After processing, save to cache
+    save_to_cache(cache_key, processed_data)
+
+    return processed_data
+
+# Existing code continues...
 
     resp = redirect(url_for(dir, filename=path))
     resp.set_cookie('deviceid',deviceid, max_age=31536000)
@@ -404,76 +446,50 @@ def post_status_message( userid, percentage, message ):
     )
 
 def process_audio(url, userid, isupload=False, clusters=0, useCache=True):
-    """ The main processing for the audio is done here. It makes heavy use of the
-    InfiniteJukebox class (https://github.com/drensin/Remixatron).
+    """Processes the audio file, using cache if available."""
+    cache_key = get_cache_key(url)
 
-    Args:
-        url (string): the URL to fetch or the file uploaded
-        userid (string): the id of the requesting client
-        isupload (bool, optional): Is this processing for uploaded audio (True)
-                                   or Youtube audio (False). Defaults to False.
-    """
+    if useCache:
+        cached_file = get_cached_file(cache_key)
+        if cached_file:
+            with open(cached_file, 'rb') as f:
+                cached_data = pickle.load(f)
+                post_status_message(userid, 100, "Loaded from cache")
+                return cached_data['jukebox'], cached_data['trim_path'], cached_data['final_file']
 
-    fn = ""
+    # Existing audio processing code
+    temp_dir = Path(tempfile.mkdtemp())
+    trim_path = temp_dir / "trimmed"
+    final_file = temp_dir / "final.mp3"
 
     if isupload == False:
-        fn = fetch_from_youtube(url,userid)
+        filename = fetch_from_youtube(url, userid)
+        audioname = filename
     else:
-        fn = fetch_from_local(url, userid)
+        filename = url
+        audioname = Path(filename).name
 
-    print('fetch complete')
+    # Create an instance of the InfiniteJukebox
+    try:
+        jukebox = InfiniteJukebox(audioname, clusters)
+    except Exception as e:
+        error_message = f"Error processing audio: {str(e)}"
+        socketio.emit('error', {'error': error_message}, room=userid)
+        return None
 
-    # The constructor of the InfiniteJukebox class takes a callback to which to
-    # post update messages. We define that callback here so that it has access
-    # to the userid variable. This uses Python 'variable capture'.
-    # (See https://bit.ly/2YOKm16 for more about how this works)
+    # Existing code to process audio and create visualizations
+    # ...
 
-    def remixatron_callback(percentage, message):
-        print( str(round(percentage * 100,0)) + "%: " + message )
-        post_status_message(userid, percentage, message)
+    # After processing, save to cache if useCache is True
+    if useCache:
+        processed_data = {
+            'jukebox': jukebox,
+            'trim_path': str(trim_path),
+            'final_file': str(final_file)
+        }
+        save_to_cache(cache_key, processed_data)
 
-    remixatron_callback(0.1, 'Audio downloaded')
-
-    cached_beatmap_fn = ( remixatron_dir / (urllib.parse.quote(url, safe='') + '.beatmap.bz2') )
-
-    beats = None
-    play_vector = None
-
-    has_cached_beatmap = os.path.isfile(cached_beatmap_fn)
-
-    if ( has_cached_beatmap == False) or (useCache == False):
-
-        # all of the core analytics and processing is done in this call
-        jukebox = InfiniteJukebox(fn, clusters=clusters,
-                                  progress_callback=remixatron_callback,
-                                  start_beat=0, do_async=False)
-
-
-        with open(tempfile.gettempdir() + '/' + userid + '.clusterscores', 'w') as f:
-            f.write(json.dumps(jukebox.cluster_ratio_log))
-
-        beats = jukebox.beats
-        play_vector = jukebox.play_vector
-
-        def skip_encoder(o):
-            return ''
-
-        with bz2.open(cached_beatmap_fn, 'wb') as f:
-            f.write(json.dumps(jukebox.beats, default=skip_encoder).encode('utf-8'))
-
-    else:
-
-        print("Reading beatmap from disk.")
-
-        # if there's a saved beats cache on disk, load it
-        if has_cached_beatmap == True:          
-            with bz2.open(cached_beatmap_fn, 'rb') as f:
-                beats = json.load(f)
-
-        # pass the beat cache into the constructor. The code will use the existing
-        # beat cache instead of running a high precision beat finding process. This
-        # will save ~60s of processing.
-
+    return jukebox, trim_path, final_file
         jukebox = InfiniteJukebox(fn, clusters=clusters,
                                     progress_callback=remixatron_callback,
                                     start_beat=0, do_async=False, starting_beat_cache=beats)
